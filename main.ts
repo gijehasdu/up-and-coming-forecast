@@ -177,23 +177,25 @@ function capNamedMass(byPlace: Map<number, number>[], places: number, snapshotCo
   }
 }
 
+function emitPlaceRows(distribution: Map<number, number>, place: number): DistributionRow[] {
+  const ranked = Array.from(distribution, ([universe_id, p]) => ({ universe_id, p }))
+    .filter((row) => row.p >= 0.002)
+    .sort((a, b) => b.p - a.p || a.universe_id - b.universe_id)
+    .slice(0, 100);
+  const rounded = ranked.map((row) => ({ universe_id: row.universe_id, p: Number(row.p.toFixed(6)) }));
+  let roundedSum = rounded.reduce((sum, row) => sum + row.p, 0);
+  // Rounding can add a few ulps beyond the probability simplex.
+  while (rounded.length > 0 && roundedSum > 1) {
+    const removed = rounded.pop()!;
+    roundedSum -= removed.p;
+  }
+  return rounded.map((row) => ({ universe_id: row.universe_id, place, p: row.p }));
+}
+
 function outputRows(byPlace: Map<number, number>[], places: number): DistributionRow[] {
-  const probabilities: Array<{ universe_id: number; place: number; p: number }> = [];
+  const probabilities: DistributionRow[] = [];
   for (let place = 1; place <= places; place++) {
-    const ranked = Array.from(byPlace[place - 1], ([universe_id, p]) => ({ universe_id, p }))
-      .filter((row) => row.p >= 0.002)
-      .sort((a, b) => b.p - a.p || a.universe_id - b.universe_id)
-      .slice(0, 100);
-    const rounded = ranked.map((row) => ({ universe_id: row.universe_id, p: Number(row.p.toFixed(6)) }));
-    let roundedSum = rounded.reduce((sum, row) => sum + row.p, 0);
-    // Rounding can add a few ulps beyond the probability simplex.
-    while (rounded.length > 0 && roundedSum > 1) {
-      const removed = rounded.pop()!;
-      roundedSum -= removed.p;
-    }
-    for (const row of rounded) {
-      probabilities.push({ universe_id: row.universe_id, place, p: row.p });
-    }
+    probabilities.push(...emitPlaceRows(byPlace[place - 1], place));
   }
   return probabilities;
 }
