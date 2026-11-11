@@ -182,7 +182,7 @@ function emitPlaceRows(distribution: Map<number, number>, place: number): Distri
     .filter((row) => row.p >= 0.002)
     .sort((a, b) => b.p - a.p || a.universe_id - b.universe_id)
     .slice(0, 100);
-  const rounded = ranked.map((row) => ({ universe_id: row.universe_id, p: Number(row.p.toFixed(6)) }));
+  const rounded = ranked.map((row) => ({ universe_id: row.universe_id, p: round6(row.p) }));
   let roundedSum = rounded.reduce((sum, row) => sum + row.p, 0);
   // Rounding can add a few ulps beyond the probability simplex.
   while (rounded.length > 0 && roundedSum > 1) {
@@ -293,3 +293,9 @@ function run(): void {
 }
 
 run();
+
+// Keep six-decimal rounding for every emitted probability in one place,
+// so the format cannot drift between call sites.
+function round6(value: number): number {
+  return Number(value.toFixed(6));
+}
