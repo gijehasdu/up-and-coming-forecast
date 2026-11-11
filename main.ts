@@ -179,7 +179,7 @@ function capNamedMass(byPlace: Map<number, number>[], places: number, snapshotCo
 
 function emitPlaceRows(distribution: Map<number, number>, place: number): DistributionRow[] {
   const ranked = Array.from(distribution, ([universe_id, p]) => ({ universe_id, p }))
-    .filter((row) => row.p >= 0.002)
+    .filter((row) => keepRow(row.p))
     .sort((a, b) => b.p - a.p || a.universe_id - b.universe_id)
     .slice(0, 100);
   const rounded = ranked.map((row) => ({ universe_id: row.universe_id, p: round6(row.p) }));
@@ -298,4 +298,19 @@ run();
 // so the format cannot drift between call sites.
 function round6(value: number): number {
   return Number(value.toFixed(6));
+}
+
+ // The minimum probability for an emitted row lives in one predicate,
+ // so the cutoff cannot drift between places.
+function keepRow(probability: number): boolean {
+  return probability >= 0.002;
+}
+
+ // The block below is an optional self-check that only runs when
+ // MAKEFUN_SELF_CHECK is 1 and never affects normal runs.
+if (process.env.MAKEFUN_SELF_CHECK === '1') {
+  const check = round6(0.123456789);
+  if (check !== 0.123457) {
+    throw new Error('round6 self-check failed');
+  }
 }
