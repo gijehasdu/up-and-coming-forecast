@@ -1,205 +1,283 @@
-// up-and-coming-forecast: a probabilistic forecast of Roblox's Up-and-Coming chart.
-//
-// The program reads the chart history in /input/history.ndjson plus /input/task.json and writes
-// /output/forecast.json: for each of the chart's top 10 places, a probability for each game named
-// being at that place over the scored window, and a top 10 in order.
-//
-// Model, in one paragraph: the chart churns too fast for a persistence forecast, so each place's
-// distribution is built from the whole history with exponential recency weighting (a 40-hour time
-// constant): how often each game sat at each rank, smoothed across neighbouring ranks. A fifth of
-// the result is a "the chart has barely moved yet" component centred on the last read, which is
-// what the window's first hours look like. Every place keeps a large share unnamed (45% at place 1
-// rising to 70% at place 10): that share is spread over every game the forecast did not name, which
-// is how new arrivals and games outside the recent top ranks get their probability. Where the
-// history carries a game's creation date, a game is also scaled by the share of the scored window
-// it spends inside the chart's 28-day age limit, because a game that ages out cannot hold a place.
-//
-// The forecast is deterministic: no randomness anywhere, so two runs on the same history produce
-// the same bytes.
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 
-import { readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
-
-const INPUT_DIR = process.env.MAKEFUN_INPUT_DIR ?? '/input';
-const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
-
-/** Recency time constant, hours: a read this old counts e^-1 against the newest one. */
-const TAU_HOURS = 40;
-/** Ranks whose sightings feed the per-place distributions (a game seen at 11-14 can still rise). */
-const COUNTED_RANKS = 14;
-/** Neighbour smoothing over ranks: weight on rank k-1, k, k+1 when building place k. */
-const RANK_KERNEL: ReadonlyArray<readonly [number, number]> = [
-  [-1, 0.18],
-  [0, 0.64],
-  [1, 0.18],
-];
-/** Share of each place borrowed from the last read's chart, spread over two neighbours each way. */
-const LAST_CHART_SHARE = 0.2;
-const LAST_CHART_KERNEL: ReadonlyArray<readonly [number, number]> = [
-  [-2, 0.08],
-  [-1, 0.24],
-  [0, 0.36],
-  [1, 0.24],
-  [2, 0.08],
-];
-/** Unnamed share left at place 1 and at place 10, ramped linearly between them. */
-const UNNAMED_FIRST = 0.45;
-const UNNAMED_LAST = 0.7;
-/** Rows smaller than this are dropped: they cannot move a log score and only cost bytes. */
-const MIN_ROW = 0.002;
-/** The chart only lists games published within this many days. */
-const AGE_LIMIT_MS = 28 * 24 * 3600 * 1000;
-
-interface ChartRow {
-  rank: number;
-  universe_id: number;
-}
-
-interface Snapshot {
-  at: string;
-  up_and_coming?: ChartRow[];
-  details?: unknown;
-}
-
-interface GameDetail {
-  created?: string;
-}
-
-const task = JSON.parse(readFileSync(join(INPUT_DIR, 'task.json'), 'utf8')) as {
-  places: number;
-  output: string;
-  window: { from: string; until: string };
+type ChartRow = { rank: number; universe_id: number };
+type Snapshot = {
+  at: number;
+  rows: ChartRow[];
+  details: unknown;
 };
-const places = task.places;
+type DistributionRow = { universe_id: number; p: number };
 
-const lines = readFileSync(join(INPUT_DIR, 'history.ndjson'), 'utf8')
-  .split('\n')
-  .filter((l) => l.trim() !== '');
-const snapshots: Snapshot[] = lines
-  .map((l) => JSON.parse(l) as Snapshot)
-  .filter((s) => Array.isArray(s.up_and_coming) && s.up_and_coming.length > 0)
-  .sort((a, b) => Date.parse(a.at) - Date.parse(b.at));
+const HOURS = 60 * 60 * 1000;
+const DECAY_TIME = 40 * HOURS;
+const AGE_LIMIT = 28 * 24 * HOURS;
+const NEIGHBOR_WEIGHTS = [0.18, 0.64, 0.18] as const;
+const NEWEST_CHART_WEIGHTS = [0.08, 0.24, 0.36, 0.24, 0.08] as const;
 
-const lastTime = Date.parse(snapshots[snapshots.length - 1]!.at);
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
 
-// Recency weights, one per snapshot.
-const weights = snapshots.map((s) => Math.exp(-(lastTime - Date.parse(s.at)) / (TAU_HOURS * 3600 * 1000)));
-const weightSum = weights.reduce((a, b) => a + b, 0);
+function timestamp(value: unknown): number | null {
+  if (typeof value !== 'string') return null;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
 
-// Weighted sightings: sightings.get(game).get(rank) = weighted count of the game at that rank.
-const sightings = new Map<number, Map<number, number>>();
-snapshots.forEach((snap, i) => {
-  const w = weights[i]!;
-  for (const row of snap.up_and_coming!) {
-    if (row.rank > COUNTED_RANKS) continue;
-    let byRank = sightings.get(row.universe_id);
-    if (byRank === undefined) {
-      byRank = new Map();
-      sightings.set(row.universe_id, byRank);
+function snapshotFrom(value: unknown): Snapshot | null {
+  if (!isRecord(value)) return null;
+  const at = timestamp(value.at);
+  if (at === null || !Array.isArray(value.up_and_coming)) return null;
+
+  const rows: ChartRow[] = [];
+  for (const candidate of value.up_and_coming) {
+    if (!isRecord(candidate)) continue;
+    const { rank, universe_id: universeId } = candidate;
+    if (!Number.isInteger(rank) || (rank as number) < 1) continue;
+    if (!Number.isInteger(universeId) || (universeId as number) <= 0) continue;
+    rows.push({ rank: rank as number, universe_id: universeId as number });
+  }
+  if (rows.length === 0) return null;
+  return { at, rows, details: value.details };
+}
+
+function snapshotsFromFile(filePath: string): Snapshot[] {
+  const contents = fs.readFileSync(filePath, 'utf8');
+  const snapshots: Snapshot[] = [];
+  for (const line of contents.split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    try {
+      const snapshot = snapshotFrom(JSON.parse(line) as unknown);
+      if (snapshot) snapshots.push(snapshot);
+    } catch {
+      // Skip malformed lines while retaining the rest of the history.
     }
-    byRank.set(row.rank, (byRank.get(row.rank) ?? 0) + w);
   }
-});
-
-// Creation dates, from any snapshot that carries details: the newest detail wins.
-function detailCreated(details: unknown, universeId: number): string | undefined {
-  if (details === null || typeof details !== 'object') return undefined;
-  let entry: unknown;
-  if (Array.isArray(details)) {
-    entry = (details as Array<Record<string, unknown>>).find((d) => d?.id === universeId || d?.universe_id === universeId);
-  } else {
-    entry = (details as Record<string, unknown>)[String(universeId)];
-  }
-  const created = (entry as GameDetail | undefined)?.created;
-  return typeof created === 'string' ? created : undefined;
-}
-const createdAt = new Map<number, number>();
-for (const snap of snapshots) {
-  if (snap.details === undefined || snap.details === null) continue;
-  for (const row of snap.up_and_coming!) {
-    const c = detailCreated(snap.details, row.universe_id);
-    if (c !== undefined) createdAt.set(row.universe_id, Date.parse(c));
-  }
+  snapshots.sort((a, b) => a.at - b.at);
+  return snapshots;
 }
 
-// Share of the scored window each game spends inside the age limit (1 when its age is unknown).
-const windowFrom = Date.parse(task.window.from);
-const windowUntil = Date.parse(task.window.until);
-const windowMs = Math.max(1, windowUntil - windowFrom);
-function eligibleShare(universeId: number): number {
-  const created = createdAt.get(universeId);
-  if (created === undefined || Number.isNaN(created)) return 1;
-  const agesOutAt = created + AGE_LIMIT_MS;
-  if (agesOutAt <= windowFrom) return 0;
-  if (agesOutAt >= windowUntil) return 1;
-  return (agesOutAt - windowFrom) / windowMs;
+function creationTimes(snapshots: Snapshot[]): Map<number, number> {
+  const created = new Map<number, number>();
+  // Ascending snapshots make the newest usable creation detail win.
+  for (const snapshot of snapshots) {
+    const details = snapshot.details;
+    if (Array.isArray(details)) {
+      for (const entry of details) {
+        if (!isRecord(entry)) continue;
+        const id = entry.id ?? entry.universe_id;
+        const parsedId = typeof id === 'string' && /^\d+$/.test(id) ? Number(id) : id;
+        if (!Number.isInteger(parsedId) || (parsedId as number) <= 0) continue;
+        const time = timestamp(entry.created);
+        if (time !== null) created.set(parsedId as number, time);
+      }
+    } else if (isRecord(details)) {
+      for (const [key, entry] of Object.entries(details)) {
+        if (!/^\d+$/.test(key) || !isRecord(entry)) continue;
+        const time = timestamp(entry.created);
+        if (time !== null) created.set(Number(key), time);
+      }
+    }
+  }
+  return created;
 }
 
-// The last read's chart, in order, for the barely-moved component and the final tie-breaks.
-const lastChart = [...snapshots[snapshots.length - 1]!.up_and_coming!]
-  .sort((a, b) => a.rank - b.rank)
-  .map((r) => r.universe_id);
-const lastRank = new Map<number, number>(lastChart.map((id, i) => [id, i + 1]));
-
-interface ProbRow {
-  universe_id: number;
-  place: number;
-  p: number;
+function activeWindowShare(createdAt: number | undefined, from: number, until: number): number {
+  if (createdAt === undefined) return 1;
+  const birthday = createdAt + AGE_LIMIT;
+  if (birthday <= from) return 0;
+  if (birthday >= until) return 1;
+  return (birthday - from) / (until - from);
 }
 
-// A short history knows less about the chart's habits, so it trusts its named rows less: the
-// unnamed ramp below is lifted toward UNNAMED_LAST everywhere as the snapshot count falls to zero.
-const historyConfidence = Math.min(1, snapshots.length / 40);
+function orderedRows(rows: ChartRow[]): ChartRow[] {
+  return rows.slice().sort((a, b) => a.rank - b.rank || a.universe_id - b.universe_id);
+}
 
-const probabilities: ProbRow[] = [];
-const totalMass = new Map<number, number>();
-for (let place = 1; place <= places; place++) {
-  const ramped = UNNAMED_FIRST + ((UNNAMED_LAST - UNNAMED_FIRST) * (place - 1)) / Math.max(1, places - 1);
-  const unnamed = ramped + (UNNAMED_LAST - ramped) * (1 - historyConfidence);
-  const rows = new Map<number, number>();
-  // History component: kernel-smoothed weighted sightings at this place.
-  for (const [id, byRank] of sightings) {
-    let v = 0;
-    for (const [offset, kw] of RANK_KERNEL) v += kw * (byRank.get(place + offset) ?? 0);
-    v /= weightSum;
-    if (v > 0) rows.set(id, v);
+function buildRankProbabilities(snapshots: Snapshot[], places: number): Map<number, number>[] {
+  const byPlace = Array.from({ length: places }, () => new Map<number, number>());
+  const rankWeights = new Map<number, Map<number, number>>();
+  let totalWeight = 0;
+  const newest = snapshots[snapshots.length - 1];
+
+  if (newest) {
+    for (const snapshot of snapshots) {
+      const weight = Math.exp(-(newest.at - snapshot.at) / DECAY_TIME);
+      totalWeight += weight;
+      for (const row of snapshot.rows) {
+        if (row.rank > 14) continue;
+        let counts = rankWeights.get(row.universe_id);
+        if (!counts) {
+          counts = new Map<number, number>();
+          rankWeights.set(row.universe_id, counts);
+        }
+        counts.set(row.rank, (counts.get(row.rank) ?? 0) + weight);
+      }
+    }
+
+    if (totalWeight > 0) {
+      for (const [universeId, counts] of rankWeights) {
+        for (let place = 1; place <= places; place++) {
+          const raw = (
+            NEIGHBOR_WEIGHTS[0] * (counts.get(place - 1) ?? 0) +
+            NEIGHBOR_WEIGHTS[1] * (counts.get(place) ?? 0) +
+            NEIGHBOR_WEIGHTS[2] * (counts.get(place + 1) ?? 0)
+          ) / totalWeight;
+          if (raw > 0) byPlace[place - 1].set(universeId, raw * 0.8);
+        }
+      }
+
+      // Add the small newest-chart blend, preserving its rank-based neighbor weights.
+      const newestRows = orderedRows(newest.rows);
+      const idAtRank = new Map(newestRows.map((row) => [row.rank, row.universe_id]));
+      for (let place = 1; place <= places; place++) {
+        const distribution = byPlace[place - 1];
+        for (let offset = -2; offset <= 2; offset++) {
+          const gameId = idAtRank.get(place + offset);
+          if (gameId === undefined) continue;
+          distribution.set(gameId, (distribution.get(gameId) ?? 0) + 0.2 * NEWEST_CHART_WEIGHTS[offset + 2]);
+        }
+      }
+    }
   }
-  // Blend in the barely-moved component, then scale each game by its eligible share of the window.
-  for (const [id, v] of [...rows]) rows.set(id, v * (1 - LAST_CHART_SHARE));
-  for (const [offset, kw] of LAST_CHART_KERNEL) {
-    const id = lastChart[place - 1 + offset];
-    if (id !== undefined) rows.set(id, (rows.get(id) ?? 0) + kw * LAST_CHART_SHARE);
-  }
-  for (const [id, v] of [...rows]) {
-    const share = eligibleShare(id);
-    if (share <= 0) rows.delete(id);
-    else rows.set(id, v * share);
-  }
-  // Cap the named mass at 1 - unnamed, drop dust, and keep the largest rows (at most 100 a place).
-  let sum = [...rows.values()].reduce((a, b) => a + b, 0);
-  if (sum > 1 - unnamed) {
-    const scale = (1 - unnamed) / sum;
-    for (const [id, v] of rows) rows.set(id, v * scale);
-    sum = 1 - unnamed;
-  }
-  const kept = [...rows.entries()]
-    .filter(([, v]) => v >= MIN_ROW)
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 100);
-  for (const [id, v] of kept) {
-    probabilities.push({ universe_id: id, place, p: Math.round(v * 1e6) / 1e6 });
-    totalMass.set(id, (totalMass.get(id) ?? 0) + v);
+  return byPlace;
+}
+
+function applyAgeOut(
+  byPlace: Map<number, number>[],
+  snapshots: Snapshot[],
+  windowFrom: number,
+  windowUntil: number,
+): void {
+  const created = creationTimes(snapshots);
+  // Expired games are removed; games aging out within the window retain their active share.
+  for (const distribution of byPlace) {
+    for (const [gameId, value] of distribution) {
+      const share = activeWindowShare(created.get(gameId), windowFrom, windowUntil);
+      if (share <= 0) distribution.delete(gameId);
+      else distribution.set(gameId, value * share);
+    }
   }
 }
 
-// Top 10: most total probability mass first; ties go to the game ranked higher when the history ends.
-const top10 = [...totalMass.entries()]
-  .sort((a, b) => b[1] - a[1] || (lastRank.get(a[0]) ?? 999) - (lastRank.get(b[0]) ?? 999))
-  .slice(0, places)
-  .map(([id]) => id);
-for (const id of lastChart) {
-  if (top10.length >= places) break;
-  if (!top10.includes(id)) top10.push(id);
+function capNamedMass(byPlace: Map<number, number>[], places: number, snapshotCount: number): void {
+  const confidence = Math.min(1, snapshotCount / 40);
+  for (let place = 1; place <= places; place++) {
+    const ramp = places === 1 ? 0.45 : 0.45 + (0.70 - 0.45) * ((place - 1) / (places - 1));
+    const unnamed = ramp + (0.70 - ramp) * (1 - confidence);
+    const cap = 1 - unnamed;
+    const distribution = byPlace[place - 1];
+    let sum = 0;
+    for (const value of distribution.values()) sum += value;
+    if (sum > cap && sum > 0) {
+      const scale = cap / sum;
+      for (const [gameId, value] of distribution) distribution.set(gameId, value * scale);
+    }
+  }
 }
 
-writeFileSync(join(OUTPUT_DIR, task.output), `${JSON.stringify({ probabilities, top10 })}\n`);
+function outputRows(byPlace: Map<number, number>[], places: number): DistributionRow[] {
+  const probabilities: Array<{ universe_id: number; place: number; p: number }> = [];
+  for (let place = 1; place <= places; place++) {
+    const ranked = Array.from(byPlace[place - 1], ([universe_id, p]) => ({ universe_id, p }))
+      .filter((row) => row.p >= 0.002)
+      .sort((a, b) => b.p - a.p || a.universe_id - b.universe_id)
+      .slice(0, 100);
+    const rounded = ranked.map((row) => ({ universe_id: row.universe_id, p: Number(row.p.toFixed(6)) }));
+    let roundedSum = rounded.reduce((sum, row) => sum + row.p, 0);
+    // Rounding can add a few ulps beyond the probability simplex.
+    while (rounded.length > 0 && roundedSum > 1) {
+      const removed = rounded.pop()!;
+      roundedSum -= removed.p;
+    }
+    for (const row of rounded) {
+      probabilities.push({ universe_id: row.universe_id, place, p: row.p });
+    }
+  }
+  return probabilities;
+}
+
+function topGames(byPlace: Map<number, number>[], snapshots: Snapshot[], places: number): number[] {
+  const allGames = new Set<number>();
+  const totalMass = new Map<number, number>();
+  for (const distribution of byPlace) {
+    for (const [gameId, value] of distribution) {
+      allGames.add(gameId);
+      totalMass.set(gameId, (totalMass.get(gameId) ?? 0) + value);
+    }
+  }
+
+  const newest = snapshots[snapshots.length - 1];
+  const newestRank = new Map<number, number>();
+  if (newest) {
+    for (const row of newest.rows) {
+      const previous = newestRank.get(row.universe_id);
+      if (previous === undefined || row.rank < previous) newestRank.set(row.universe_id, row.rank);
+    }
+  }
+  const top10 = Array.from(totalMass.keys()).sort((a, b) =>
+    (totalMass.get(b)! - totalMass.get(a)!) ||
+    ((newestRank.get(a) ?? Number.POSITIVE_INFINITY) - (newestRank.get(b) ?? Number.POSITIVE_INFINITY)) ||
+    a - b,
+  ).slice(0, places);
+
+  if (top10.length < places && newest) {
+    const newestRows = orderedRows(newest.rows);
+    for (const row of newestRows) {
+      if (top10.length >= places) break;
+      if (!top10.includes(row.universe_id)) top10.push(row.universe_id);
+    }
+  }
+  // If the newest chart is short, use earlier sightings to fill remaining slots.
+  if (top10.length < places) {
+    for (let index = snapshots.length - 1; index >= 0 && top10.length < places; index--) {
+      const rows = orderedRows(snapshots[index].rows);
+      for (const row of rows) {
+        if (top10.length >= places) break;
+        if (!top10.includes(row.universe_id)) top10.push(row.universe_id);
+      }
+    }
+  }
+  if (top10.length < places) {
+    for (const gameId of Array.from(allGames).sort((a, b) => a - b)) {
+      if (top10.length >= places) break;
+      if (!top10.includes(gameId)) top10.push(gameId);
+    }
+  }
+  return top10;
+}
+
+function run(): void {
+  const inputDir = process.env.MAKEFUN_INPUT_DIR ?? '/input';
+  const outputDir = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
+  const taskValue: unknown = JSON.parse(fs.readFileSync(path.join(inputDir, 'task.json'), 'utf8'));
+  const task = isRecord(taskValue) ? taskValue : {};
+  const placesValue = task.places;
+  const outputValue = task.output;
+  const window = isRecord(task.window) ? task.window : {};
+  const places = Number.isInteger(placesValue) && (placesValue as number) > 0 ? placesValue as number : 10;
+  const outputName = typeof outputValue === 'string' && outputValue.length > 0 ? outputValue : 'forecast.json';
+  const parsedWindowFrom = timestamp(window.from);
+  const parsedWindowUntil = timestamp(window.until);
+  // Invalid window bounds use a unit interval and therefore leave age shares unchanged.
+  const windowFrom = parsedWindowFrom !== null && parsedWindowUntil !== null && parsedWindowUntil > parsedWindowFrom ? parsedWindowFrom : 0;
+  const windowUntil = parsedWindowFrom !== null && parsedWindowUntil !== null && parsedWindowUntil > parsedWindowFrom ? parsedWindowUntil : 1;
+
+  let snapshots: Snapshot[] = [];
+  try {
+    snapshots = snapshotsFromFile(path.join(inputDir, 'history.ndjson'));
+  } catch {
+    // Missing or unreadable history is equivalent to no usable snapshots.
+  }
+
+  const byPlace = buildRankProbabilities(snapshots, places);
+  applyAgeOut(byPlace, snapshots, windowFrom, windowUntil);
+  capNamedMass(byPlace, places, snapshots.length);
+  const probabilities = outputRows(byPlace, places);
+  const top10 = topGames(byPlace, snapshots, places);
+  const output = { probabilities, top10 };
+  fs.writeFileSync(path.join(outputDir, outputName), `${JSON.stringify(output).replace(/\n+$/, '')}\n`, 'utf8');
+}
+
+run();
