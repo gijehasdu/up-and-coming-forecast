@@ -221,12 +221,16 @@ function topGames(byPlace: Map<number, number>[], snapshots: Snapshot[], places:
     ((newestRank.get(a) ?? Number.POSITIVE_INFINITY) - (newestRank.get(b) ?? Number.POSITIVE_INFINITY)) ||
     a - b,
   ).slice(0, places);
+  const top10Set = new Set(top10);
 
   if (top10.length < places && newest) {
     const newestRows = orderedRows(newest.rows);
     for (const row of newestRows) {
       if (top10.length >= places) break;
-      if (!top10.includes(row.universe_id)) top10.push(row.universe_id);
+      if (!top10Set.has(row.universe_id)) {
+        top10.push(row.universe_id);
+        top10Set.add(row.universe_id);
+      }
     }
   }
   // If the newest chart is short, use earlier sightings to fill remaining slots.
@@ -235,14 +239,20 @@ function topGames(byPlace: Map<number, number>[], snapshots: Snapshot[], places:
       const rows = orderedRows(snapshots[index].rows);
       for (const row of rows) {
         if (top10.length >= places) break;
-        if (!top10.includes(row.universe_id)) top10.push(row.universe_id);
+        if (!top10Set.has(row.universe_id)) {
+          top10.push(row.universe_id);
+          top10Set.add(row.universe_id);
+        }
       }
     }
   }
   if (top10.length < places) {
     for (const gameId of Array.from(allGames).sort((a, b) => a - b)) {
       if (top10.length >= places) break;
-      if (!top10.includes(gameId)) top10.push(gameId);
+      if (!top10Set.has(gameId)) {
+        top10.push(gameId);
+        top10Set.add(gameId);
+      }
     }
   }
   return top10;
